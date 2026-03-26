@@ -1,5 +1,6 @@
 import re
 import subprocess
+import sys
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 from urllib.parse import quote_plus, urlparse
@@ -12,6 +13,7 @@ MODEL = "deepseek-v3.1:671b-cloud"
 KNOWN_SITES = {
     "youtube": "https://www.youtube.com",
     "gmail": "https://mail.google.com",
+    "google mail": "https://mail.google.com",
     "whatsapp": "https://web.whatsapp.com",
     "whatsapp web": "https://web.whatsapp.com",
     "web.whatsapp.com": "https://web.whatsapp.com",
@@ -20,6 +22,9 @@ KNOWN_SITES = {
     "netflix": "https://www.netflix.com",
     "duckduckgo": "https://duckduckgo.com",
     "github": "https://github.com",
+    "stackoverflow": "https://stackoverflow.com",
+    "amazon prime": "https://www.primevideo.com",
+    "prime video": "https://www.primevideo.com",
 }
 
 ORDINALS = {
@@ -92,21 +97,142 @@ def ask_normal(client: Client, state: BrowserState, user_text: str) -> str:
     return reply
 
 
+def is_real_tab(page):
+    try:
+        url = (page.url or "").strip().lower()
+    except Exception:
+        return False
+
+    if not url:
+        return False
+
+    bad_prefixes = (
+        "devtools://",
+        "chrome://",
+        "chrome-search://",
+        "chrome-extension://",
+        "edge-extension://",
+        "about:",
+    )
+
+    if url.startswith(bad_prefixes):
+        return False
+
+    if "omnibox-popup.top-chrome" in url:
+        return False
+
+    if "new-tab-page" in url:
+        return False
+
+    return True
+
+
+def pick_best_page(context: BrowserContext) -> Page:
+    pages = context.pages
+
+    real_pages = [p for p in pages if is_real_tab(p)]
+    if real_pages:
+        page = real_pages[-1]
+        try:
+            page.bring_to_front()
+        except Exception:
+            pass
+        return page
+
+    if pages:
+        page = pages[-1]
+        try:
+            page.bring_to_front()
+        except Exception:
+            pass
+        return page
+
+    page = context.new_page()
+    try:
+        page.bring_to_front()
+    except Exception:
+        pass
+    return page
+
+
+def connect_existing_chrome():
+    playwright = sync_playwright().start()
+
+    browser = playwright.chromium.connect_over_cdp(
+        "http://127.0.0.1:9222",
+        slow_mo=120,
+        timeout=30000,
+    )
+
+    if not browser.contexts:
+        raise RuntimeError(
+            "No Chrome context found. Start Chrome first with remote debugging."
+        )
+
+    context = browser.contexts[0]
+
+    print("\nAttached pages:")
+    for i, p in enumerate(context.pages, start=1):
+        try:
+            print(f"{i}. {p.url}")
+        except Exception:
+            print(f"{i}. <unavailable>")
+
+    # find first real webpage tab
+    real_pages = [p for p in context.pages if is_real_tab(p)]
+
+    if real_pages:
+        page = real_pages[-1]
+    else:
+        print("\nNo real webpage tab found. Creating one...")
+        page = context.new_page()
+        page.goto("https://duckduckgo.com", wait_until="load", timeout=30000)
+
+    try:
+        page.bring_to_front()
+    except Exception:
+        pass
+
+    print(f"\nUsing tab: {page.url}\n")
+    return playwright, browser, context, page
+
+
 def current_page(context: BrowserContext, state: BrowserState) -> Page:
     pages = context.pages
     if not pages:
         page = context.new_page()
         state.current_tab = 0
+        try:
+            page.bring_to_front()
+        except Exception:
+            pass
         return page
 
     state.current_tab = max(0, min(state.current_tab, len(pages) - 1))
-    return pages[state.current_tab]
+    candidate = pages[state.current_tab]
+
+    if not is_real_tab(candidate):
+        candidate = pick_best_page(context)
+        try:
+            state.current_tab = context.pages.index(candidate)
+        except Exception:
+            state.current_tab = 0
+
+    try:
+        candidate.bring_to_front()
+    except Exception:
+        pass
+
+    return candidate
 
 
 def switch_to_newest_page(context: BrowserContext, state: BrowserState, before_count: int) -> None:
     if len(context.pages) > before_count:
-        state.current_tab = len(context.pages) - 1
-        context.pages[state.current_tab].bring_to_front()
+        newest = pick_best_page(context)
+        try:
+            state.current_tab = context.pages.index(newest)
+        except Exception:
+            state.current_tab = len(context.pages) - 1
 
 
 def current_domain(page: Page) -> str:
@@ -153,8 +279,7 @@ def open_known_or_search(page: Page, target: str) -> str:
     lower = raw.lower()
 
     if lower in KNOWN_SITES:
-        url = KNOWN_SITES[lower]
-        page.goto(url, wait_until="load", timeout=30000)
+        page.goto(KNOWN_SITES[lower], wait_until="load", timeout=30000)
         return f"opened {lower}"
 
     if looks_like_url(raw):
@@ -179,8 +304,7 @@ def search_ddg(page: Page, query: str) -> str:
 
 
 def search_within_site(page: Page, query: str) -> str:
-    domain = current_domain(page)
-    host = domain.replace("www.", "")
+    host = current_domain(page).replace("www.", "")
     scoped_query = f"site:{host} {query.strip()}"
     page.goto(
         f"https://duckduckgo.com/?q={quote_plus(scoped_query)}",
@@ -188,6 +312,17 @@ def search_within_site(page: Page, query: str) -> str:
         timeout=30000,
     )
     return f"searched {host} for {query.strip()}"
+
+
+def ordinal_from_text(text: str) -> Optional[int]:
+    lower = text.lower()
+
+    for word, num in ORDINALS.items():
+        if re.search(rf"\b{re.escape(word)}\b", lower):
+            return num
+
+    m = re.search(r"\b(\d+)(?:st|nd|rd|th)?\b", lower)
+    return int(m.group(1)) if m else None
 
 
 def open_result(context: BrowserContext, state: BrowserState, index: int) -> str:
@@ -206,7 +341,7 @@ def open_result(context: BrowserContext, state: BrowserState, index: int) -> str
             if count >= index:
                 before = len(context.pages)
                 loc.nth(index - 1).click(timeout=5000)
-                page.wait_for_timeout(1400)
+                page.wait_for_timeout(1200)
                 switch_to_newest_page(context, state, before)
                 return f"opened result {index}"
         except Exception:
@@ -237,8 +372,72 @@ def click_text(context: BrowserContext, state: BrowserState, text: str) -> str:
     return f"could not click {text}"
 
 
+def focus_video_player(page: Page) -> None:
+    for selector in ["#movie_player", "video", "body"]:
+        try:
+            page.locator(selector).first.click(timeout=1500)
+            page.wait_for_timeout(200)
+            return
+        except Exception:
+            pass
+
+
+def youtube_next_prev(page: Page, command: str) -> str:
+    js_cmd = "next" if command == "next" else "previous"
+
+    try:
+        result = page.evaluate(
+            """(cmd) => {
+                const norm = s => (s || '').trim().toLowerCase();
+                const buttons = Array.from(document.querySelectorAll('button, a, [role="button"]'));
+
+                const preferredHints = cmd === 'next'
+                  ? ['next', 'next video', 'next song', 'next track', 'skip']
+                  : ['previous', 'prev', 'previous video', 'previous song', 'previous track'];
+
+                for (const el of buttons) {
+                  const bag = [
+                    el.innerText,
+                    el.textContent,
+                    el.getAttribute('aria-label'),
+                    el.getAttribute('title'),
+                    el.getAttribute('aria-description')
+                  ].map(norm).join(' ');
+
+                  if (preferredHints.some(h => bag.includes(h))) {
+                    el.click();
+                    return 'clicked youtube control';
+                  }
+                }
+
+                return 'not found';
+            }""",
+            js_cmd,
+        )
+
+        if result == "clicked youtube control":
+            return f"{command} triggered"
+    except Exception:
+        pass
+
+    focus_video_player(page)
+
+    try:
+        if command == "next":
+            page.keyboard.press("Shift+N")
+            return "next triggered"
+        page.keyboard.press("Shift+P")
+        return "previous triggered"
+    except Exception:
+        return f"could not {command}"
+
+
 def media_control(page: Page, command: str) -> str:
     cmd = command.lower().strip()
+    host = current_domain(page)
+
+    if "youtube.com" in host and cmd in {"next", "previous"}:
+        return youtube_next_prev(page, cmd)
 
     try:
         result = page.evaluate(
@@ -248,10 +447,14 @@ def media_control(page: Page, command: str) -> str:
 
                 const clickByHints = (hints) => {
                   for (const el of buttons) {
-                    const text = norm(el.innerText || el.textContent || '');
-                    const aria = norm(el.getAttribute('aria-label') || '');
-                    const title = norm(el.getAttribute('title') || '');
-                    const bag = `${text} ${aria} ${title}`;
+                    const bag = [
+                      el.innerText,
+                      el.textContent,
+                      el.getAttribute('aria-label'),
+                      el.getAttribute('title'),
+                      el.getAttribute('aria-description')
+                    ].map(norm).join(' ');
+
                     if (hints.some(h => bag.includes(h))) {
                       el.click();
                       return true;
@@ -297,18 +500,6 @@ def media_control(page: Page, command: str) -> str:
                   }
                 }
 
-                if (cmd === 'next') {
-                  if (clickByHints(['next', 'skip', 'next episode', 'next song', 'next video'])) {
-                    return 'next triggered';
-                  }
-                }
-
-                if (cmd === 'previous') {
-                  if (clickByHints(['previous', 'prev', 'back', 'previous song', 'previous video'])) {
-                    return 'previous triggered';
-                  }
-                }
-
                 return 'no media control found';
             }""",
             cmd,
@@ -319,25 +510,22 @@ def media_control(page: Page, command: str) -> str:
     except Exception:
         pass
 
-    host = current_domain(page)
-    fallbacks = {
-        ("youtube.com", "pause"): "k",
-        ("youtube.com", "play"): "k",
-        ("youtube.com", "resume"): "k",
-        ("youtube.com", "mute"): "m",
-        ("youtube.com", "unmute"): "m",
-        ("youtube.com", "fullscreen"): "f",
-        ("youtube.com", "next"): "Shift+N",
-        ("youtube.com", "previous"): "Shift+P",
-    }
-
-    for (domain_hint, action), key in fallbacks.items():
-        if domain_hint in host and action == cmd:
+    if "youtube.com" in host:
+        focus_video_player(page)
+        keymap = {
+            "pause": "k",
+            "play": "k",
+            "resume": "k",
+            "mute": "m",
+            "unmute": "m",
+            "fullscreen": "f",
+        }
+        if cmd in keymap:
             try:
-                page.keyboard.press(key)
-                return f"sent {cmd} shortcut"
+                page.keyboard.press(keymap[cmd])
+                return f"sent YouTube shortcut for {cmd}"
             except Exception:
-                break
+                pass
 
     return f"could not {cmd}"
 
@@ -370,11 +558,10 @@ def site_aware_play(context: BrowserContext, state: BrowserState, query: str) ->
     query = query.strip()
 
     if "youtube.com" in host:
-        result = youtube_search_and_play(page, query)
         state.last_media_site = "youtube"
-        return result
+        return youtube_search_and_play(page, query)
 
-    if "hotstar.com" in host or "netflix.com" in host:
+    if "hotstar.com" in host or "netflix.com" in host or "primevideo.com" in host:
         search_within_site(page, query)
         opened = open_result(context, state, 1)
         page = current_page(context, state)
@@ -382,9 +569,8 @@ def site_aware_play(context: BrowserContext, state: BrowserState, query: str) ->
         state.last_media_site = host
         return f"{opened}; tried to play {query} on {host}"
 
-    result = youtube_search_and_play(page, query)
     state.last_media_site = "youtube"
-    return result
+    return youtube_search_and_play(page, query)
 
 
 def list_tabs(context: BrowserContext, state: BrowserState) -> str:
@@ -454,7 +640,10 @@ def summarize_page(client: Client, page: Page) -> str:
 def new_tab(context: BrowserContext, state: BrowserState, target: Optional[str] = None) -> str:
     page = context.new_page()
     state.current_tab = len(context.pages) - 1
-    page.bring_to_front()
+    try:
+        page.bring_to_front()
+    except Exception:
+        pass
 
     if target:
         return open_known_or_search(page, target)
@@ -466,7 +655,10 @@ def new_tab(context: BrowserContext, state: BrowserState, target: Optional[str] 
 def switch_tab(context: BrowserContext, state: BrowserState, num: int) -> str:
     if 1 <= num <= len(context.pages):
         state.current_tab = num - 1
-        context.pages[state.current_tab].bring_to_front()
+        try:
+            context.pages[state.current_tab].bring_to_front()
+        except Exception:
+            pass
         return f"switched to tab {num}"
     return f"tab {num} does not exist"
 
@@ -477,19 +669,11 @@ def close_tab(context: BrowserContext, state: BrowserState) -> str:
 
     current_page(context, state).close()
     state.current_tab = min(state.current_tab, len(context.pages) - 2)
-    current_page(context, state).bring_to_front()
+    try:
+        current_page(context, state).bring_to_front()
+    except Exception:
+        pass
     return "closed current tab"
-
-
-def ordinal_from_text(text: str) -> Optional[int]:
-    lower = text.lower()
-
-    for word, num in ORDINALS.items():
-        if re.search(rf"\b{re.escape(word)}\b", lower):
-            return num
-
-    m = re.search(r"\b(\d+)(?:st|nd|rd|th)?\b", lower)
-    return int(m.group(1)) if m else None
 
 
 def parse_command(text: str, browser_mode: bool) -> Tuple[Optional[str], Optional[str]]:
@@ -498,6 +682,9 @@ def parse_command(text: str, browser_mode: bool) -> Tuple[Optional[str], Optiona
 
     if lower in {"exit browser", "stop browser mode", "close browser mode"}:
         return "exit_browser", None
+
+    if lower in {"browser mode", "enter browser mode"}:
+        return "enter_browser", None
 
     if lower in {"new tab", "open new tab"}:
         return "new_tab", ""
@@ -585,11 +772,15 @@ def parse_command(text: str, browser_mode: bool) -> Tuple[Optional[str], Optiona
     if lower.startswith("go to in browser"):
         return "open", raw[len("go to in browser"):].strip()
 
+    if lower.startswith("open "):
+        target = raw[5:].strip()
+        if target.lower() in KNOWN_SITES or looks_like_url(target):
+            return "open", target
+        if browser_mode:
+            return "open", target
+
     if browser_mode and lower.startswith("search "):
         return "search", raw[7:].strip()
-
-    if browser_mode and lower.startswith("open "):
-        return "open", raw[5:].strip()
 
     return None, None
 
@@ -608,6 +799,10 @@ def handle_browser_command(
     if cmd == "exit_browser":
         state.browser_mode = False
         return True, "Browser mode off"
+
+    if cmd == "enter_browser":
+        state.browser_mode = True
+        return True, "Browser mode on"
 
     state.browser_mode = True
     page = current_page(context, state)
@@ -675,27 +870,33 @@ def main():
     client = Client()
     state = BrowserState()
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=False,
-            slow_mo=120,
-            args=["--autoplay-policy=no-user-gesture-required"],
-        )
-        context = browser.new_context()
-        page = context.new_page()
-        page.goto("https://duckduckgo.com", wait_until="load", timeout=30000)
+    try:
+        playwright, browser, context, page = connect_existing_chrome()
+    except Exception as e:
+        print(f"Failed to connect to Chrome: {e}")
+        print("Start Chrome first with remote debugging enabled.")
+        sys.exit(1)
+
+    try:
+        try:
+            if page.url in ("", "about:blank", "chrome://newtab/"):
+                page.goto("https://duckduckgo.com", wait_until="load", timeout=30000)
+        except Exception:
+            pass
 
         print("Jarvis terminal ready.")
+        print("Connected to existing Chrome via CDP.")
+        print()
         print("Examples:")
-        print("  search in browser next js basic videos")
-        print("  open first result")
-        print("  pause")
+        print("  open youtube")
+        print("  play hi nanna songs")
         print("  next song")
+        print("  pause")
         print("  open new tab")
         print("  open hotstar")
         print("  play game of thrones")
-        print("  summarize this page")
         print("  exit browser")
+        print("  what is event loop in javascript")
         print()
 
         while True:
@@ -723,7 +924,9 @@ def main():
             if reply:
                 speak(reply)
 
-        browser.close()
+    finally:
+        # Keep Chrome running; just detach Playwright.
+        playwright.stop()
 
 
 if __name__ == "__main__":
