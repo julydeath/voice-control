@@ -383,60 +383,54 @@ def focus_video_player(page: Page) -> None:
 
 
 def youtube_next_prev(page: Page, command: str) -> str:
-    js_cmd = "next" if command == "next" else "previous"
-
-    try:
-        result = page.evaluate(
-            """(cmd) => {
-                const norm = s => (s || '').trim().toLowerCase();
-                const buttons = Array.from(document.querySelectorAll('button, a, [role="button"]'));
-
-                const preferredHints = cmd === 'next'
-                  ? ['next', 'next video', 'next song', 'next track', 'skip']
-                  : ['previous', 'prev', 'previous video', 'previous song', 'previous track'];
-
-                for (const el of buttons) {
-                  const bag = [
-                    el.innerText,
-                    el.textContent,
-                    el.getAttribute('aria-label'),
-                    el.getAttribute('title'),
-                    el.getAttribute('aria-description')
-                  ].map(norm).join(' ');
-
-                  if (preferredHints.some(h => bag.includes(h))) {
-                    el.click();
-                    return 'clicked youtube control';
-                  }
-                }
-
-                return 'not found';
-            }""",
-            js_cmd,
-        )
-
-        if result == "clicked youtube control":
-            return f"{command} triggered"
-    except Exception:
-        pass
-
     focus_video_player(page)
+
+    if command == "next":
+        selectors = [
+            "button.ytp-next-button",
+            "a.ytp-next-button",
+            'button[aria-keyshortcuts="SHIFT+n"]',
+            'a[aria-keyshortcuts="SHIFT+n"]',
+            'button[aria-label*="Next"]',
+            'a[aria-label*="Next"]',
+        ]
+    else:
+        selectors = [
+            "button.ytp-prev-button",
+            "a.ytp-prev-button",
+            'button[aria-keyshortcuts="SHIFT+p"]',
+            'a[aria-keyshortcuts="SHIFT+p"]',
+            'button[aria-label*="Previous"]',
+            'a[aria-label*="Previous"]',
+        ]
+
+    for selector in selectors:
+        try:
+            loc = page.locator(selector)
+            if loc.count() > 0:
+                loc.first.click(timeout=2000)
+                page.wait_for_timeout(1000)
+                return f"{command} triggered"
+        except Exception:
+            pass
 
     try:
         if command == "next":
             page.keyboard.press("Shift+N")
+            page.wait_for_timeout(1000)
             return "next triggered"
-        page.keyboard.press("Shift+P")
-        return "previous triggered"
+        else:
+            page.keyboard.press("Shift+P")
+            page.wait_for_timeout(1000)
+            return "previous triggered"
     except Exception:
         return f"could not {command}"
-
 
 def media_control(page: Page, command: str) -> str:
     cmd = command.lower().strip()
     host = current_domain(page)
 
-    if "youtube.com" in host and cmd in {"next", "previous"}:
+    if ("youtube.com" in host or "music.youtube.com" in host) and cmd in {"next", "previous"}:
         return youtube_next_prev(page, cmd)
 
     try:
