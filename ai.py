@@ -1,45 +1,50 @@
 import re
 import subprocess
-from urllib.parse import quote_plus
-from typing import List
+from dataclasses import dataclass, field
+from typing import List, Optional, Tuple
+from urllib.parse import quote_plus, urlparse
 
 from ollama import Client
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import BrowserContext, Page, sync_playwright
 
 MODEL = "deepseek-v3.1:671b-cloud"
-NORMAL_SYSTEM = (
-    "You are a helpful terminal voice assistant. "
-    "Be practical, concise, and useful. "
-    "When explaining coding or software topics, teach clearly with examples."
-)
 
-ORDINAL_WORDS = {
-    "first": 1,
-    "1st": 1,
-    "one": 1,
-    "second": 2,
-    "2nd": 2,
-    "two": 2,
-    "third": 3,
-    "3rd": 3,
-    "three": 3,
-    "fourth": 4,
-    "4th": 4,
-    "five": 5,
-    "fifth": 5,
+KNOWN_SITES = {
+    "youtube": "https://www.youtube.com",
+    "gmail": "https://mail.google.com",
+    "whatsapp": "https://web.whatsapp.com",
+    "whatsapp web": "https://web.whatsapp.com",
+    "web.whatsapp.com": "https://web.whatsapp.com",
+    "hotstar": "https://www.hotstar.com",
+    "disney hotstar": "https://www.hotstar.com",
+    "netflix": "https://www.netflix.com",
+    "duckduckgo": "https://duckduckgo.com",
+    "github": "https://github.com",
 }
 
-EXPLICIT_BROWSER_PREFIXES = (
-    "search in browser",
-    "search this in browser",
-    "open in browser",
-    "browser search",
-    "browser open",
-    "browser mode",
-    "go to in browser",
+ORDINALS = {
+    "first": 1, "1st": 1, "one": 1,
+    "second": 2, "2nd": 2, "two": 2,
+    "third": 3, "3rd": 3, "three": 3,
+    "fourth": 4, "4th": 4, "four": 4,
+    "fifth": 5, "5th": 5, "five": 5,
+}
+
+NORMAL_SYSTEM = (
+    "You are a helpful terminal voice assistant. "
+    "Answer clearly, practically, and briefly. "
+    "For coding or software topics, teach step by step."
 )
 
-client = Client()
+
+@dataclass
+class BrowserState:
+    browser_mode: bool = False
+    current_tab: int = 0
+    last_media_site: str = ""
+    normal_history: List[dict] = field(
+        default_factory=lambda: [{"role": "system", "content": NORMAL_SYSTEM}]
+    )
 
 
 def speak(text: str) -> None:
@@ -47,15 +52,16 @@ def speak(text: str) -> None:
     if not text:
         return
     try:
-        subprocess.Popen(["say", text])
+        subprocess.Popen(["say", text[:700]])
     except Exception:
         pass
 
 
-def stream_chat(messages: List[dict]) -> str:
+def stream_chat(client: Client, messages: List[dict]) -> str:
     stream = client.chat(model=MODEL, messages=messages, stream=True)
     out = []
     print("\nAssistant> ", end="", flush=True)
+
     for part in stream:
         chunk = ""
         try:
@@ -65,21 +71,49 @@ def stream_chat(messages: List[dict]) -> str:
                 chunk = part.message.content
             except Exception:
                 chunk = ""
+
         if chunk:
             print(chunk, end="", flush=True)
             out.append(chunk)
+
     print()
     return "".join(out).strip()
 
 
-def ask_normal(history: List[dict], user_text: str) -> str:
-    history.append({"role": "user", "content": user_text})
-    reply = stream_chat(history)
-    history.append({"role": "assistant", "content": reply})
-    if len(history) > 14:
-        system = history[0]
-        history[:] = [system] + history[-13:]
+def ask_normal(client: Client, state: BrowserState, user_text: str) -> str:
+    state.normal_history.append({"role": "user", "content": user_text})
+    reply = stream_chat(client, state.normal_history)
+    state.normal_history.append({"role": "assistant", "content": reply})
+
+    if len(state.normal_history) > 14:
+        system = state.normal_history[0]
+        state.normal_history = [system] + state.normal_history[-13:]
+
     return reply
+
+
+def current_page(context: BrowserContext, state: BrowserState) -> Page:
+    pages = context.pages
+    if not pages:
+        page = context.new_page()
+        state.current_tab = 0
+        return page
+
+    state.current_tab = max(0, min(state.current_tab, len(pages) - 1))
+    return pages[state.current_tab]
+
+
+def switch_to_newest_page(context: BrowserContext, state: BrowserState, before_count: int) -> None:
+    if len(context.pages) > before_count:
+        state.current_tab = len(context.pages) - 1
+        context.pages[state.current_tab].bring_to_front()
+
+
+def current_domain(page: Page) -> str:
+    try:
+        return urlparse(page.url).netloc.lower()
+    except Exception:
+        return ""
 
 
 def looks_like_url(text: str) -> bool:
@@ -88,450 +122,510 @@ def looks_like_url(text: str) -> bool:
         return True
     if " " in text:
         return False
-    if "." in text:
-        return True
-    return False
+    return "." in text
 
 
 def normalize_url(text: str) -> str:
     text = text.strip()
     if text.startswith(("http://", "https://")):
         return text
-    if not text.startswith("www.") and "." not in text:
-        return f"https://{text}.com"
     return f"https://{text}"
 
 
-def safe_title(page) -> str:
+def safe_title(page: Page) -> str:
     try:
         return page.title() or ""
     except Exception:
         return ""
 
 
-def safe_text(page, max_chars: int = 6000) -> str:
+def safe_text(page: Page, max_chars: int = 5000) -> str:
     try:
-        text = page.evaluate(
-            """
-            () => {
-              const body = document.body;
-              return body ? (body.innerText || '') : '';
-            }
-            """
-        )
+        text = page.evaluate("""() => (document.body ? (document.body.innerText || '') : '')""")
         text = " ".join((text or "").split())
         return text[:max_chars]
     except Exception:
         return ""
 
 
-def refresh_pages(state) -> None:
-    pages = state["context"].pages
-    if not pages:
-        state["page"] = state["context"].new_page()
-        state["current_tab"] = 0
-        return
-    idx = max(0, min(state.get("current_tab", 0), len(pages) - 1))
-    state["page"] = pages[idx]
-    state["current_tab"] = idx
+def open_known_or_search(page: Page, target: str) -> str:
+    raw = target.strip()
+    lower = raw.lower()
+
+    if lower in KNOWN_SITES:
+        url = KNOWN_SITES[lower]
+        page.goto(url, wait_until="load", timeout=30000)
+        return f"opened {lower}"
+
+    if looks_like_url(raw):
+        page.goto(normalize_url(raw), wait_until="load", timeout=30000)
+        return f"opened {raw}"
+
+    page.goto(
+        f"https://duckduckgo.com/?q={quote_plus(raw)}",
+        wait_until="load",
+        timeout=30000,
+    )
+    return f"searched DuckDuckGo for {raw}"
 
 
-def current_page(state):
-    refresh_pages(state)
-    return state["page"]
+def search_ddg(page: Page, query: str) -> str:
+    page.goto(
+        f"https://duckduckgo.com/?q={quote_plus(query.strip())}",
+        wait_until="load",
+        timeout=30000,
+    )
+    return f"searched DuckDuckGo for {query.strip()}"
 
 
-def maybe_switch_to_newest_page(state, before_count: int) -> None:
-    pages = state["context"].pages
-    if len(pages) > before_count:
-        state["current_tab"] = len(pages) - 1
-        state["page"] = pages[-1]
+def search_within_site(page: Page, query: str) -> str:
+    domain = current_domain(page)
+    host = domain.replace("www.", "")
+    scoped_query = f"site:{host} {query.strip()}"
+    page.goto(
+        f"https://duckduckgo.com/?q={quote_plus(scoped_query)}",
+        wait_until="load",
+        timeout=30000,
+    )
+    return f"searched {host} for {query.strip()}"
 
 
-def ddg_search(page, query: str) -> str:
-    page.goto(f"https://duckduckgo.com/?q={quote_plus(query)}", wait_until="load", timeout=30000)
-    return f"searched DuckDuckGo for: {query}"
-
-
-def open_target(page, target: str) -> str:
-    target = target.strip()
-    lower = target.lower()
-    aliases = {
-        "youtube": "https://www.youtube.com",
-        "github": "https://github.com",
-        "gmail": "https://mail.google.com",
-        "duckduckgo": "https://duckduckgo.com",
-        "google": "https://www.google.com",
-        "stackoverflow": "https://stackoverflow.com",
-    }
-    if lower in aliases:
-        url = aliases[lower]
-    elif looks_like_url(target):
-        url = normalize_url(target)
-    else:
-        return ddg_search(page, target)
-    page.goto(url, wait_until="load", timeout=30000)
-    return f"opened {url}"
-
-
-def open_nth_visible_link(page, index: int, state) -> str:
-    try:
-        links = page.locator("a:visible")
-        count = links.count()
-        if count >= index:
-            before = len(state["context"].pages)
-            links.nth(index - 1).click(timeout=5000)
-            page.wait_for_timeout(1200)
-            maybe_switch_to_newest_page(state, before)
-            return f"opened visible link {index}"
-    except Exception:
-        pass
-    return f"could not open link {index}"
-
-
-def open_search_result(page, index: int, state) -> str:
+def open_result(context: BrowserContext, state: BrowserState, index: int) -> str:
+    page = current_page(context, state)
     selectors = [
         "a[data-testid='result-title-a']",
         "article h2 a",
         "h2 a",
+        "a:visible",
     ]
+
     for selector in selectors:
         try:
             loc = page.locator(selector)
             count = loc.count()
             if count >= index:
-                before = len(state["context"].pages)
+                before = len(context.pages)
                 loc.nth(index - 1).click(timeout=5000)
-                page.wait_for_timeout(1200)
-                maybe_switch_to_newest_page(state, before)
+                page.wait_for_timeout(1400)
+                switch_to_newest_page(context, state, before)
                 return f"opened result {index}"
         except Exception:
             pass
-    return open_nth_visible_link(page, index, state)
+
+    return f"could not open result {index}"
 
 
-def list_visible_links(page, limit: int = 12) -> List[str]:
-    try:
-        data = page.evaluate(
-            """(limit) => {
-              const nodes = Array.from(document.querySelectorAll('a'));
-              const out = [];
-              for (const a of nodes) {
-                const style = window.getComputedStyle(a);
-                const rect = a.getBoundingClientRect();
-                const text = (a.innerText || a.textContent || '').trim();
-                const href = a.href || '';
-                const visible = style && style.visibility !== 'hidden' && style.display !== 'none' && rect.width > 0 && rect.height > 0;
-                if (visible && (text || href)) out.push({text, href});
-                if (out.length >= limit) break;
-              }
-              return out;
-            }""",
-            limit,
-        )
-        lines = []
-        for i, item in enumerate(data, start=1):
-            text = (item.get("text") or "").strip() or "[no text]"
-            href = (item.get("href") or "").strip()
-            lines.append(f"{i}. {text} — {href}")
-        return lines
-    except Exception:
-        return []
+def click_text(context: BrowserContext, state: BrowserState, text: str) -> str:
+    page = current_page(context, state)
 
-
-def click_text(page, text: str, state) -> str:
     candidates = [
         page.get_by_role("link", name=text, exact=False),
         page.get_by_role("button", name=text, exact=False),
         page.get_by_text(text, exact=False),
     ]
+
     for locator in candidates:
         try:
-            before = len(state["context"].pages)
+            before = len(context.pages)
             locator.first.click(timeout=4000)
-            page.wait_for_timeout(1000)
-            maybe_switch_to_newest_page(state, before)
-            return f"clicked: {text}"
+            page.wait_for_timeout(900)
+            switch_to_newest_page(context, state, before)
+            return f"clicked {text}"
         except Exception:
             pass
-    return f"could not click: {text}"
+
+    return f"could not click {text}"
 
 
-def scroll_page(page, direction: str, amount: int = 1400) -> str:
-    delta = amount if direction == "down" else -amount
-    page.mouse.wheel(0, delta)
-    page.wait_for_timeout(600)
-    return f"scrolled {direction}"
-
-
-def video_control(page, command: str) -> str:
+def media_control(page: Page, command: str) -> str:
     cmd = command.lower().strip()
+
     try:
         result = page.evaluate(
             """(cmd) => {
-                const v = Array.from(document.querySelectorAll('video')).find(x => !!x) || document.querySelector('video');
-                if (!v) return {ok:false, message:'no video element found'};
-                if (cmd === 'pause') { v.pause(); return {ok:true, message:'video paused'}; }
-                if (cmd === 'play' || cmd === 'resume') { v.play().catch(() => {}); return {ok:true, message:'video playing'}; }
-                if (cmd === 'mute') { v.muted = true; return {ok:true, message:'video muted'}; }
-                if (cmd === 'unmute') { v.muted = false; return {ok:true, message:'video unmuted'}; }
+                const norm = s => (s || '').trim().toLowerCase();
+                const buttons = Array.from(document.querySelectorAll('button, a, [role="button"]'));
+
+                const clickByHints = (hints) => {
+                  for (const el of buttons) {
+                    const text = norm(el.innerText || el.textContent || '');
+                    const aria = norm(el.getAttribute('aria-label') || '');
+                    const title = norm(el.getAttribute('title') || '');
+                    const bag = `${text} ${aria} ${title}`;
+                    if (hints.some(h => bag.includes(h))) {
+                      el.click();
+                      return true;
+                    }
+                  }
+                  return false;
+                };
+
+                const v = document.querySelector('video');
+
+                if (cmd === 'pause') {
+                  if (v) { v.pause(); return 'video paused'; }
+                  if (clickByHints(['pause'])) return 'pause clicked';
+                }
+
+                if (cmd === 'play' || cmd === 'resume') {
+                  if (v) { v.play().catch(() => {}); return 'video playing'; }
+                  if (clickByHints(['play', 'resume'])) return 'play clicked';
+                }
+
+                if (cmd === 'mute') {
+                  if (v) { v.muted = true; return 'video muted'; }
+                  if (clickByHints(['mute'])) return 'mute clicked';
+                }
+
+                if (cmd === 'unmute') {
+                  if (v) { v.muted = false; return 'video unmuted'; }
+                  if (clickByHints(['unmute'])) return 'unmute clicked';
+                }
+
                 if (cmd === 'fullscreen') {
-                    if (v.requestFullscreen) { v.requestFullscreen().catch(() => {}); return {ok:true, message:'entered fullscreen'}; }
-                    return {ok:false, message:'fullscreen not supported'};
+                  if (v && v.requestFullscreen) {
+                    v.requestFullscreen().catch(() => {});
+                    return 'entered fullscreen';
+                  }
+                  if (clickByHints(['fullscreen', 'full screen'])) return 'fullscreen clicked';
                 }
+
                 if (cmd === 'exit fullscreen') {
-                    if (document.fullscreenElement && document.exitFullscreen) { document.exitFullscreen().catch(() => {}); return {ok:true, message:'exited fullscreen'}; }
-                    return {ok:false, message:'not in fullscreen'};
+                  if (document.fullscreenElement && document.exitFullscreen) {
+                    document.exitFullscreen().catch(() => {});
+                    return 'exited fullscreen';
+                  }
                 }
-                return {ok:false, message:'unknown video command'};
+
+                if (cmd === 'next') {
+                  if (clickByHints(['next', 'skip', 'next episode', 'next song', 'next video'])) {
+                    return 'next triggered';
+                  }
+                }
+
+                if (cmd === 'previous') {
+                  if (clickByHints(['previous', 'prev', 'back', 'previous song', 'previous video'])) {
+                    return 'previous triggered';
+                  }
+                }
+
+                return 'no media control found';
             }""",
             cmd,
         )
-        if result.get("ok"):
-            return result["message"]
+
+        if result and result != "no media control found":
+            return result
     except Exception:
         pass
 
-    fallback = {
-        "pause": "k",
-        "play": "k",
-        "resume": "k",
-        "mute": "m",
-        "unmute": "m",
-        "fullscreen": "f",
-        "exit fullscreen": "f",
-    }.get(cmd)
+    host = current_domain(page)
+    fallbacks = {
+        ("youtube.com", "pause"): "k",
+        ("youtube.com", "play"): "k",
+        ("youtube.com", "resume"): "k",
+        ("youtube.com", "mute"): "m",
+        ("youtube.com", "unmute"): "m",
+        ("youtube.com", "fullscreen"): "f",
+        ("youtube.com", "next"): "Shift+N",
+        ("youtube.com", "previous"): "Shift+P",
+    }
 
-    if fallback:
-        try:
-            page.keyboard.press(fallback)
-            return f"sent fallback key for {cmd}"
-        except Exception as e:
-            return f"video control failed: {e}"
+    for (domain_hint, action), key in fallbacks.items():
+        if domain_hint in host and action == cmd:
+            try:
+                page.keyboard.press(key)
+                return f"sent {cmd} shortcut"
+            except Exception:
+                break
 
-    return "video control failed"
+    return f"could not {cmd}"
 
 
-def summarize_current_page(page) -> str:
-    content = safe_text(page, 8000)
-    prompt = (
-        f"Summarize this web page for me.\n\n"
-        f"Title: {safe_title(page)}\n"
-        f"URL: {page.url}\n"
-        f"Content:\n{content}\n\n"
-        f"Give me: 1) what it is 2) key points 3) what matters most."
+def youtube_search_and_play(page: Page, query: str) -> str:
+    page.goto(
+        f"https://www.youtube.com/results?search_query={quote_plus(query)}",
+        wait_until="load",
+        timeout=30000,
     )
-    messages = [
-        {"role": "system", "content": "You summarize web pages clearly and briefly."},
-        {"role": "user", "content": prompt},
-    ]
-    return stream_chat(messages)
+    page.wait_for_timeout(1800)
 
-
-def list_tabs(state) -> str:
-    lines = []
-    for i, p in enumerate(state["context"].pages, start=1):
-        marker = "*" if i - 1 == state["current_tab"] else " "
-        title = ""
+    for selector in ["a#video-title", "ytd-video-renderer a#video-title"]:
         try:
-            title = p.title()
+            loc = page.locator(selector)
+            if loc.count() > 0:
+                loc.first.click(timeout=5000)
+                page.wait_for_timeout(2500)
+                media_control(page, "play")
+                return f"playing {query} on YouTube"
         except Exception:
-            title = "(loading)"
-        lines.append(f"{marker} {i}. {title} — {p.url}")
+            pass
+
+    return f"found YouTube results but could not start {query}"
+
+
+def site_aware_play(context: BrowserContext, state: BrowserState, query: str) -> str:
+    page = current_page(context, state)
+    host = current_domain(page)
+    query = query.strip()
+
+    if "youtube.com" in host:
+        result = youtube_search_and_play(page, query)
+        state.last_media_site = "youtube"
+        return result
+
+    if "hotstar.com" in host or "netflix.com" in host:
+        search_within_site(page, query)
+        opened = open_result(context, state, 1)
+        page = current_page(context, state)
+        media_control(page, "play")
+        state.last_media_site = host
+        return f"{opened}; tried to play {query} on {host}"
+
+    result = youtube_search_and_play(page, query)
+    state.last_media_site = "youtube"
+    return result
+
+
+def list_tabs(context: BrowserContext, state: BrowserState) -> str:
+    lines = []
+    for i, p in enumerate(context.pages, start=1):
+        marker = "*" if i - 1 == state.current_tab else " "
+        lines.append(f"{marker} {i}. {safe_title(p) or '(untitled)'} — {p.url}")
     return "\n".join(lines) if lines else "no tabs"
 
 
-def switch_tab(state, n: int) -> str:
-    pages = state["context"].pages
-    if 1 <= n <= len(pages):
-        state["current_tab"] = n - 1
-        state["page"] = pages[n - 1]
-        state["page"].bring_to_front()
-        return f"switched to tab {n}"
-    return f"tab {n} does not exist"
+def list_links(page: Page, limit: int = 12) -> str:
+    try:
+        data = page.evaluate(
+            """(limit) => {
+              const nodes = Array.from(document.querySelectorAll('a'));
+              const out = [];
+
+              for (const a of nodes) {
+                const style = window.getComputedStyle(a);
+                const rect = a.getBoundingClientRect();
+                const text = (a.innerText || a.textContent || '').trim();
+                const href = a.href || '';
+                const visible =
+                  style &&
+                  style.visibility !== 'hidden' &&
+                  style.display !== 'none' &&
+                  rect.width > 0 &&
+                  rect.height > 0;
+
+                if (visible && (text || href)) out.push({text, href});
+                if (out.length >= limit) break;
+              }
+
+              return out;
+            }""",
+            limit,
+        )
+
+        lines = []
+        for i, item in enumerate(data, start=1):
+            text = (item.get("text") or "").strip() or "[no text]"
+            href = (item.get("href") or "").strip()
+            lines.append(f"{i}. {text} — {href}")
+
+        return "\n".join(lines) if lines else "no visible links found"
+    except Exception:
+        return "no visible links found"
 
 
-def close_current_tab(state) -> str:
-    pages = state["context"].pages
-    if len(pages) <= 1:
-        return "cannot close the last tab"
-    idx = state["current_tab"]
-    pages[idx].close()
-    refresh_pages(state)
-    state["page"].bring_to_front()
-    return "closed current tab"
+def summarize_page(client: Client, page: Page) -> str:
+    messages = [
+        {"role": "system", "content": "You summarize web pages briefly and clearly."},
+        {
+            "role": "user",
+            "content": (
+                f"Summarize this page.\n"
+                f"Title: {safe_title(page)}\n"
+                f"URL: {page.url}\n"
+                f"Content:\n{safe_text(page, 8000)}\n\n"
+                f"Give me 1) what it is 2) main points 3) what matters most."
+            ),
+        },
+    ]
+    return stream_chat(client, messages)
 
 
-def new_tab(state, target: str = "") -> str:
-    page = state["context"].new_page()
-    state["page"] = page
-    state["current_tab"] = len(state["context"].pages) - 1
+def new_tab(context: BrowserContext, state: BrowserState, target: Optional[str] = None) -> str:
+    page = context.new_page()
+    state.current_tab = len(context.pages) - 1
+    page.bring_to_front()
+
     if target:
-        return open_target(page, target)
+        return open_known_or_search(page, target)
+
     page.goto("https://duckduckgo.com", wait_until="load", timeout=30000)
     return "opened new tab"
 
 
-def ordinal_from_text(text: str):
-    for word, num in ORDINAL_WORDS.items():
-        if re.search(rf"\b{re.escape(word)}\b", text):
+def switch_tab(context: BrowserContext, state: BrowserState, num: int) -> str:
+    if 1 <= num <= len(context.pages):
+        state.current_tab = num - 1
+        context.pages[state.current_tab].bring_to_front()
+        return f"switched to tab {num}"
+    return f"tab {num} does not exist"
+
+
+def close_tab(context: BrowserContext, state: BrowserState) -> str:
+    if len(context.pages) <= 1:
+        return "cannot close the last tab"
+
+    current_page(context, state).close()
+    state.current_tab = min(state.current_tab, len(context.pages) - 2)
+    current_page(context, state).bring_to_front()
+    return "closed current tab"
+
+
+def ordinal_from_text(text: str) -> Optional[int]:
+    lower = text.lower()
+
+    for word, num in ORDINALS.items():
+        if re.search(rf"\b{re.escape(word)}\b", lower):
             return num
-    m = re.search(r"\b(\d+)(?:st|nd|rd|th)?\b", text)
-    if m:
-        return int(m.group(1))
-    return None
+
+    m = re.search(r"\b(\d+)(?:st|nd|rd|th)?\b", lower)
+    return int(m.group(1)) if m else None
 
 
-def parse_browser_command(text: str, browser_mode_active: bool):
+def parse_command(text: str, browser_mode: bool) -> Tuple[Optional[str], Optional[str]]:
     raw = text.strip()
-    lower = raw.lower().strip()
+    lower = raw.lower()
 
     if lower in {"exit browser", "stop browser mode", "close browser mode"}:
-        return ("exit_browser_mode", None)
+        return "exit_browser", None
 
-    if browser_mode_active and lower in {"pause", "play", "resume", "mute", "unmute", "fullscreen", "exit fullscreen"}:
-        return ("video", lower)
+    if lower in {"new tab", "open new tab"}:
+        return "new_tab", ""
 
-    if browser_mode_active and lower in {"go back", "back"}:
-        return ("back", None)
-
-    if browser_mode_active and lower in {"go forward", "forward"}:
-        return ("forward", None)
-
-    if browser_mode_active and lower == "reload":
-        return ("reload", None)
-
-    if browser_mode_active and lower in {"read page", "read this page"}:
-        return ("read_page", None)
-
-    if browser_mode_active and lower in {"summarize page", "summarise page", "summarize this page", "summarise this page"}:
-        return ("summarize_page", None)
-
-    if browser_mode_active and lower in {"list tabs"}:
-        return ("list_tabs", None)
-
-    if browser_mode_active and lower in {"list links", "show links"}:
-        return ("list_links", None)
-
-    if browser_mode_active and lower in {"current url"}:
-        return ("current_url", None)
-
-    if browser_mode_active and lower == "close tab":
-        return ("close_tab", None)
-
-    if browser_mode_active and lower == "new tab":
-        return ("new_tab", "")
-
-    if browser_mode_active and lower.startswith("new tab "):
-        return ("new_tab", raw[8:].strip())
+    if lower.startswith("new tab "):
+        return "new_tab", raw[8:].strip()
 
     m = re.match(r"^(?:switch to|open)\s+tab\s+(\d+)$", lower)
-    if browser_mode_active and m:
-        return ("switch_tab", int(m.group(1)))
+    if m:
+        return "switch_tab", m.group(1)
 
-    if browser_mode_active and lower.startswith("scroll down"):
-        return ("scroll", ("down", 1400))
+    if lower == "close tab":
+        return "close_tab", None
 
-    if browser_mode_active and lower.startswith("scroll up"):
-        return ("scroll", ("up", 1400))
+    if lower in {"list tabs", "show tabs"}:
+        return "list_tabs", None
 
-    if browser_mode_active and lower.startswith("click "):
-        return ("click_text", raw[6:].strip())
+    if lower in {"list links", "show links"}:
+        return "list_links", None
 
-    m = re.match(r"^open\s+(?:the\s+)?(.+?)\s+(?:link|result)$", lower)
-    if browser_mode_active and m:
+    if lower in {"go back", "back"}:
+        return "back", None
+
+    if lower in {"go forward", "forward"}:
+        return "forward", None
+
+    if lower == "reload":
+        return "reload", None
+
+    if lower in {"pause", "play", "resume", "mute", "unmute", "fullscreen", "exit fullscreen"}:
+        return "media", lower
+
+    if lower in {"next song", "next video", "next", "skip"}:
+        return "media", "next"
+
+    if lower in {"previous song", "previous video", "previous", "prev"}:
+        return "media", "previous"
+
+    if lower in {"read page", "read this page"}:
+        return "read_page", None
+
+    if lower in {"summarize page", "summarize this page", "summarise page", "summarise this page"}:
+        return "summarize_page", None
+
+    m = re.match(r"^open\s+(?:the\s+)?(.+?)\s+(?:result|link)$", lower)
+    if m:
         n = ordinal_from_text(m.group(1))
         if n:
-            return ("open_result", n)
+            return "open_result", str(n)
 
-    m = re.match(r"^open\s+link\s+(\d+)$", lower)
-    if browser_mode_active and m:
-        return ("open_result", int(m.group(1)))
+    m = re.match(r"^open\s+result\s+(\d+)$", lower)
+    if m:
+        return "open_result", m.group(1)
+
+    if lower.startswith("click "):
+        return "click_text", raw[6:].strip()
+
+    if lower.startswith("scroll down"):
+        return "scroll", "down"
+
+    if lower.startswith("scroll up"):
+        return "scroll", "up"
 
     if lower.startswith("search in browser and play "):
-        return ("youtube_play", raw[len("search in browser and play "):].strip())
+        return "play_query", raw[len("search in browser and play "):].strip()
 
-    if browser_mode_active and lower.startswith("play "):
-        return ("youtube_play", raw[5:].strip())
+    if browser_mode and lower.startswith("play "):
+        return "play_query", raw[5:].strip()
 
     if lower.startswith("search in browser"):
-        return ("search", raw[len("search in browser"):].strip())
+        return "search", raw[len("search in browser"):].strip()
 
     if lower.startswith("search this in browser"):
-        return ("search", raw[len("search this in browser"):].strip())
+        return "search", raw[len("search this in browser"):].strip()
 
     if lower.startswith("browser search"):
-        return ("search", raw[len("browser search"):].strip())
+        return "search", raw[len("browser search"):].strip()
 
     if lower.startswith("open in browser"):
-        return ("open", raw[len("open in browser"):].strip())
+        return "open", raw[len("open in browser"):].strip()
 
     if lower.startswith("browser open"):
-        return ("open", raw[len("browser open"):].strip())
+        return "open", raw[len("browser open"):].strip()
 
     if lower.startswith("go to in browser"):
-        return ("open", raw[len("go to in browser"):].strip())
+        return "open", raw[len("go to in browser"):].strip()
 
-    if browser_mode_active and lower.startswith("search "):
-        return ("search", raw[7:].strip())
+    if browser_mode and lower.startswith("search "):
+        return "search", raw[7:].strip()
 
-    if browser_mode_active and lower.startswith("open "):
-        return ("open", raw[5:].strip())
+    if browser_mode and lower.startswith("open "):
+        return "open", raw[5:].strip()
 
-    return (None, None)
-
-
-def youtube_play(state, query: str) -> str:
-    page = current_page(state)
-    page.goto(f"https://www.youtube.com/results?search_query={quote_plus(query)}", wait_until="load", timeout=30000)
-    page.wait_for_timeout(1800)
-    candidates = [
-        page.locator("a#video-title").first,
-        page.locator("ytd-video-renderer a#video-title").first,
-    ]
-    for c in candidates:
-        try:
-            before = len(state["context"].pages)
-            c.click(timeout=5000)
-            page.wait_for_timeout(2500)
-            maybe_switch_to_newest_page(state, before)
-            current_page(state).evaluate(
-                """() => {
-                    const v = document.querySelector('video');
-                    if (v) v.play().catch(() => {});
-                }"""
-            )
-            return f"playing YouTube result for: {query}"
-        except Exception:
-            pass
-    return f"found YouTube results, but could not start playback for: {query}"
+    return None, None
 
 
-def handle_browser_command(state, raw_text: str, browser_mode_active: bool):
-    cmd, arg = parse_browser_command(raw_text, browser_mode_active)
+def handle_browser_command(
+    client: Client,
+    context: BrowserContext,
+    state: BrowserState,
+    user_text: str,
+) -> Tuple[bool, str]:
+    cmd, arg = parse_command(user_text, state.browser_mode)
+
     if cmd is None:
         return False, "not a browser command"
 
-    if cmd == "exit_browser_mode":
-        return True, "BROWSER_MODE_OFF"
+    if cmd == "exit_browser":
+        state.browser_mode = False
+        return True, "Browser mode off"
 
-    page = current_page(state)
+    state.browser_mode = True
+    page = current_page(context, state)
 
-    if cmd == "search":
-        return True, ddg_search(page, arg)
+    if cmd == "new_tab":
+        return True, new_tab(context, state, arg or None)
 
-    if cmd == "open":
-        return True, open_target(page, arg)
+    if cmd == "switch_tab":
+        return True, switch_tab(context, state, int(arg))
 
-    if cmd == "open_result":
-        return True, open_search_result(page, arg, state)
+    if cmd == "close_tab":
+        return True, close_tab(context, state)
 
-    if cmd == "click_text":
-        return True, click_text(page, arg, state)
+    if cmd == "list_tabs":
+        return True, list_tabs(context, state)
 
-    if cmd == "scroll":
-        direction, amount = arg
-        return True, scroll_page(page, direction, amount)
+    if cmd == "list_links":
+        return True, list_links(page)
 
     if cmd == "back":
         page.go_back(wait_until="load", timeout=30000)
@@ -545,43 +639,41 @@ def handle_browser_command(state, raw_text: str, browser_mode_active: bool):
         page.reload(wait_until="load", timeout=30000)
         return True, "reloaded page"
 
-    if cmd == "video":
-        return True, video_control(page, arg)
+    if cmd == "media":
+        return True, media_control(page, arg)
 
     if cmd == "read_page":
         return True, f"TITLE: {safe_title(page)}\nURL: {page.url}\n\n{safe_text(page, 2500)}"
 
     if cmd == "summarize_page":
-        return True, summarize_current_page(page)
+        return True, summarize_page(client, page)
 
-    if cmd == "list_tabs":
-        return True, list_tabs(state)
+    if cmd == "open_result":
+        return True, open_result(context, state, int(arg))
 
-    if cmd == "switch_tab":
-        return True, switch_tab(state, arg)
+    if cmd == "click_text":
+        return True, click_text(context, state, arg)
 
-    if cmd == "close_tab":
-        return True, close_current_tab(state)
+    if cmd == "scroll":
+        page.mouse.wheel(0, 1400 if arg == "down" else -1400)
+        page.wait_for_timeout(600)
+        return True, f"scrolled {arg}"
 
-    if cmd == "new_tab":
-        return True, new_tab(state, arg)
+    if cmd == "search":
+        return True, search_ddg(page, arg)
 
-    if cmd == "list_links":
-        links = list_visible_links(page)
-        return True, "\n".join(links) if links else "no visible links found"
+    if cmd == "open":
+        return True, open_known_or_search(page, arg)
 
-    if cmd == "current_url":
-        return True, page.url
-
-    if cmd == "youtube_play":
-        return True, youtube_play(state, arg)
+    if cmd == "play_query":
+        return True, site_aware_play(context, state, arg)
 
     return True, "command recognized but not implemented"
 
 
 def main():
-    normal_history = [{"role": "system", "content": NORMAL_SYSTEM}]
-    browser_mode_active = False
+    client = Client()
+    state = BrowserState()
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -593,20 +685,15 @@ def main():
         page = context.new_page()
         page.goto("https://duckduckgo.com", wait_until="load", timeout=30000)
 
-        state = {"context": context, "page": page, "current_tab": 0}
-
         print("Jarvis terminal ready.")
-        print("Normal mode examples:")
-        print("  what is event loop in javascript")
-        print("  teach me system design from beginner level")
-        print()
-        print("Browser mode examples:")
-        print("  search in browser next js tutorials")
-        print("  open second result")
+        print("Examples:")
+        print("  search in browser next js basic videos")
+        print("  open first result")
         print("  pause")
-        print("  play")
-        print("  list tabs")
-        print("  switch to tab 2")
+        print("  next song")
+        print("  open new tab")
+        print("  open hotstar")
+        print("  play game of thrones")
         print("  summarize this page")
         print("  exit browser")
         print()
@@ -621,34 +708,20 @@ def main():
             if not user_text:
                 continue
 
-            lower = user_text.lower().strip()
-            if lower in {"exit", "quit"}:
+            if user_text.lower() in {"exit", "quit"}:
                 break
 
-            explicit_browser = any(lower.startswith(prefix) for prefix in EXPLICIT_BROWSER_PREFIXES)
-            handled, result = handle_browser_command(state, user_text, browser_mode_active)
-
-            if explicit_browser:
-                browser_mode_active = True
+            handled, result = handle_browser_command(client, context, state, user_text)
 
             if handled:
-                if result == "BROWSER_MODE_OFF":
-                    browser_mode_active = False
-                    print("\n[Browser] mode off\n")
-                    speak("Browser mode off")
-                    continue
-
-                if explicit_browser:
-                    browser_mode_active = True
-
                 print(f"\n[Browser] {result}\n")
-                if isinstance(result, str) and result and not result.startswith("TITLE:"):
-                    speak(result[:400])
+                if result and not result.startswith("TITLE:"):
+                    speak(result)
                 continue
 
-            reply = ask_normal(normal_history, user_text)
+            reply = ask_normal(client, state, user_text)
             if reply:
-                speak(reply[:700])
+                speak(reply)
 
         browser.close()
 
